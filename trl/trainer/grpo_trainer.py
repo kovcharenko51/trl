@@ -172,6 +172,15 @@ class RepeatSampler(Sampler):
         return self.num_samples * self.mini_repeat_count * self.repeat_count
 
 
+class RepeatRandomSampler(RepeatSampler):
+    def __init__(self, *args, **kwargs):
+        warnings.warn(
+            "RepeatRandomSampler is deprecated and will be removed in version 0.18. Use RepeatSampler instead.",
+            DeprecationWarning,
+        )
+        super().__init__(*args, **kwargs)
+
+
 # torch.nanstd doesn't exist, so we define it here
 def nanstd(tensor: torch.Tensor) -> torch.Tensor:
     """
@@ -357,6 +366,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        exploration_metrics = []
     ):
         # Args
         if args is None:
@@ -563,6 +573,7 @@ class GRPOTrainer(Trainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        self._exploration_metrics = exploration_metrics
         self._total_train_tokens = 0
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
@@ -1013,6 +1024,10 @@ class GRPOTrainer(Trainer):
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
                     )
 
+            per_token_logps = self._get_per_token_logps(
+                self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+            )
+
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
@@ -1022,6 +1037,9 @@ class GRPOTrainer(Trainer):
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
             completions = completions_text
+
+        num_total = 0
+        num_correct = 0
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
@@ -1048,7 +1066,10 @@ class GRPOTrainer(Trainer):
                     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                     output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                     # Convert None values to NaN
-                    output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
+                    num_total += sum([1 if reward is not None else 0 for reward in output_reward_func])
+                    num_correct += sum([int(reward['acc']) if reward is not None else 0 for reward in output_reward_func])
+
+                    output_reward_func = [reward['score'] if reward is not None else torch.nan for reward in output_reward_func]
 
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
@@ -1119,7 +1140,21 @@ class GRPOTrainer(Trainer):
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        
+        self._metrics[mode]["accuracy"].append(num_correct / num_total if num_total > 0 else 1)
 
+        entropy = (-torch.exp(per_token_logps) * per_token_logps).sum(dim=-1).mean()
+        self._metrics[mode]["entropy"].append(entropy.item())
+
+        for metric in self._exploration_metrics:
+            metric_res = metric.compute(
+                tokenizer=AutoTokenizer.from_pretrained(self.model.config._name_or_path),
+                predictions=completions_text
+            )
+
+            for metric_name, metric_value in metric_res.items():
+                self._metrics[mode][metric_name].append(metric_value)
+            
         # Log prompt and completion texts
         self._textual_logs["prompt"].extend(gather_object(prompts_text))
         self._textual_logs["completion"].extend(gather_object(completions_text))
