@@ -1,0 +1,57 @@
+job:
+  time_limit: 72h
+  flavor: h100-8x
+  region: ix-m5-sm11
+  preemption: forbidden
+  priority: high
+  generate_name: "grpo_qwen_math_1_5b_instruct"
+  image: docker-hosted.artifactory.tcsbank.ru/biglm/dapo-research/trl
+  entrypoint: ""
+  args:
+    - bash
+    - /workdir/run_grpo_qwen2.5_1.5b.sh
+
+  input:
+    - type: files
+      src: trl
+      dst: /workdir/trl
+
+    - type: files
+      src: utils
+      dst: /workdir/utils
+
+    - type: files
+      src: examples
+      dst: /workdir/examples
+
+    - type: files
+      src: .
+      dst: /workdir
+      mask: "main.py"
+
+    - type: files
+      src: .
+      dst: /workdir
+      mask: "*.sh"
+
+    - type: s3msk
+      bucket: dapo-proposal
+      src: /data
+      dst: /data
+      access_key: "KEY"
+      secret_key: "SECRET_KEY"
+      
+      cache:
+        enable: true
+        location: cluster
+
+    - type: s3msk
+      bucket: dapo-proposal
+      src: /models
+      dst: /models
+      access_key: "KEY"
+      secret_key: "SECRET_KEY"
+      
+      cache:
+        enable: true
+        location: cluster
